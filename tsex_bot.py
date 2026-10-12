@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS reports (
 CREATE TABLE IF NOT EXISTS pending (chat_id INTEGER, message_id INTEGER, sent_at TEXT);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 """)
-# eski bazaga "active" ustunini qo'shish (1 = ishlaydi, 0 = chiqarilgan)
+# eski bazaga "active" ustunini qo'shish
+# 1 = ishlaydi, 0 = chiqarilgan/rad etilgan, 2 = Oybek aka tasdiqlashini kutyapti
 try:
     db.execute("ALTER TABLE workers ADD COLUMN active INTEGER DEFAULT 1")
 except sqlite3.OperationalError:
@@ -45,7 +46,9 @@ def workers_keyboard():
     rows = db.execute("SELECT user_id, name, active FROM workers ORDER BY active DESC, name").fetchall()
     kb = []
     for uid, name, active in rows:
-        if active:
+        if active == 2:
+            kb.append([InlineKeyboardButton(f"⏳ {name} — qabul qilish", callback_data=f"back:{uid}")])
+        elif active == 1:
             kb.append([InlineKeyboardButton(f"❌ {name} — chiqarish", callback_data=f"del:{uid}")])
         else:
             kb.append([InlineKeyboardButton(f"♻️ {name} — qaytarish", callback_data=f"back:{uid}")])
@@ -126,8 +129,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     w = get_worker(update.effective_user.id)
-    if w and not w[1]:
-        await update.message.reply_text("Siz botdan chiqarilgansiz.")
+    if w and w[1] == 0:
+        await update.message.reply_text("Sizga botdan foydalanishga ruxsat yo'q.")
+        return
+    if w and w[1] == 2:
+        await update.message.reply_text("⏳ Oybek aka hali tasdiqlamadi. Tasdiqlansa, sizga xabar keladi.")
         return
     name = w[0] if w else None
     if name:
@@ -180,6 +186,33 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
         await q.answer()
+        return
+    # Yangi ishchi so'roviga javob
+    if q.data.startswith("ok:") or q.data.startswith("no:"):
+        action, uid = q.data.split(":")
+        uid = int(uid)
+        w = get_worker(uid)
+        if not w:
+            await q.answer("Topilmadi")
+            return
+        if action == "ok":
+            db.execute("UPDATE workers SET active=1 WHERE user_id=?", (uid,))
+            db.commit()
+            msg_to_worker = (f"✅ {w[0]}, Oybek aka sizni qabul qildi!\n"
+                             "Endi ortgan yoki tushirgan narsangizni yozing.\n"
+                             "Masalan: 200 ta komplekt lesa ortdim")
+            result = f"✅ {w[0]} qabul qilindi."
+        else:
+            db.execute("UPDATE workers SET active=0 WHERE user_id=?", (uid,))
+            db.commit()
+            msg_to_worker = "❌ So'rovingiz rad etildi."
+            result = f"❌ {w[0]} rad etildi. (Keyin /ishchilar orqali qaytarish mumkin)"
+        try:
+            await context.bot.send_message(uid, msg_to_worker)
+        except Exception:
+            pass
+        await q.answer()
+        await q.edit_message_text(result)
         return
     if q.data.startswith("del:") or q.data.startswith("back:"):
         action, uid = q.data.split(":")
@@ -238,18 +271,31 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     w = get_worker(uid)
-    if w and not w[1]:  # chiqarilgan ishchi
-        await msg.reply_text("Siz botdan chiqarilgansiz. Xabaringiz yuborilmadi.")
+    if w and w[1] == 0:  # chiqarilgan yoki rad etilgan
+        await msg.reply_text("Sizga botdan foydalanishga ruxsat yo'q. Xabaringiz yuborilmadi.")
         return
-    name = w[0] if w else None
-    if not name:  # birinchi yozgani — ismi
-        db.execute("INSERT INTO workers (user_id, name, active) VALUES (?,?,1)", (uid, text))
+    if w and w[1] == 2:  # hali tasdiqlanmagan
+        await msg.reply_text("⏳ Oybek aka hali tasdiqlamadi. Tasdiqlansa, sizga xabar keladi.")
+        return
+    if not w:  # birinchi yozgani — ismi, Oybek akaga so'rov ketadi
+        db.execute("INSERT INTO workers (user_id, name, active) VALUES (?,?,2)", (uid, text))
         db.commit()
+        user = update.effective_user
+        username = f"@{user.username}" if user.username else "username yo'q"
+        await context.bot.send_message(
+            ADMIN_ID,
+            f"🆕 Yangi ishchi qo'shilmoqchi:\n\n👤 {text}\n📱 {username}\n\nQabul qilasizmi?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Qabul qilish", callback_data=f"ok:{uid}"),
+                InlineKeyboardButton("❌ Rad etish", callback_data=f"no:{uid}"),
+            ]])
+        )
         await msg.reply_text(
-            f"Rahmat, {text}! Endi ortgan yoki tushirgan narsangizni yozing.\n"
-            "Masalan: 56 ta komplekt lesa tushirdim"
+            f"Rahmat, {text}! So'rovingiz Oybek akaga yuborildi.\n"
+            "⏳ Tasdiqlagandan keyin yozishingiz mumkin bo'ladi."
         )
         return
+    name = w[0]
 
     now = datetime.now()
     db.execute("INSERT INTO reports (user_id,name,text,created) VALUES (?,?,?,?)",
