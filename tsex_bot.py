@@ -27,10 +27,30 @@ CREATE TABLE IF NOT EXISTS reports (
 CREATE TABLE IF NOT EXISTS pending (chat_id INTEGER, message_id INTEGER, sent_at TEXT);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 """)
+# eski bazaga "active" ustunini qo'shish (1 = ishlaydi, 0 = chiqarilgan)
+try:
+    db.execute("ALTER TABLE workers ADD COLUMN active INTEGER DEFAULT 1")
+except sqlite3.OperationalError:
+    pass
 db.commit()
 
 
 # ---------- yordamchi funksiyalar ----------
+def get_worker(user_id):
+    """(ism, active) yoki None qaytaradi"""
+    return db.execute("SELECT name, active FROM workers WHERE user_id=?", (user_id,)).fetchone()
+
+
+def workers_keyboard():
+    rows = db.execute("SELECT user_id, name, active FROM workers ORDER BY active DESC, name").fetchall()
+    kb = []
+    for uid, name, active in rows:
+        if active:
+            kb.append([InlineKeyboardButton(f"❌ {name} — chiqarish", callback_data=f"del:{uid}")])
+        else:
+            kb.append([InlineKeyboardButton(f"♻️ {name} — qaytarish", callback_data=f"back:{uid}")])
+    return InlineKeyboardMarkup(kb) if kb else None
+
 def is_admin(update: Update):
     return update.effective_user.id == ADMIN_ID
 
@@ -92,7 +112,7 @@ ADMIN_HELP = (
     "/tozala – ishchilardagi barcha yozuvlarni hozir o'chirish\n"
     "/bugun – bugungi hisobot\n"
     "/kecha – kechagi hisobot\n"
-    "/ishchilar – ishchilar ro'yxati"
+    "/ishchilar – ishchilar ro'yxati, chiqarish yoki qaytarish"
 )
 
 
@@ -105,7 +125,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Hozir ishchilarda {hours_text(get_hours())}dan keyin o'chadi.\n\n" + ADMIN_HELP
         )
         return
-    name = get_name(update.effective_user.id)
+    w = get_worker(update.effective_user.id)
+    if w and not w[1]:
+        await update.message.reply_text("Siz botdan chiqarilgansiz.")
+        return
+    name = w[0] if w else None
     if name:
         await update.message.reply_text(
             f"{name}, xush kelibsiz!\nOrtgan yoki tushirgan narsangizni yozing.\n"
@@ -157,6 +181,38 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.from_user.id != ADMIN_ID:
         await q.answer()
         return
+    if q.data.startswith("del:") or q.data.startswith("back:"):
+        action, uid = q.data.split(":")
+        uid = int(uid)
+        w = get_worker(uid)
+        if not w:
+            await q.answer("Topilmadi")
+            return
+        if action == "del":
+            db.execute("UPDATE workers SET active=0 WHERE user_id=?", (uid,))
+            db.commit()
+            # uning chatidagi xabarlarni ham darhol o'chirish
+            rows = db.execute("SELECT chat_id, message_id FROM pending WHERE chat_id=?", (uid,)).fetchall()
+            await delete_rows(context.bot, rows)
+            try:
+                await context.bot.send_message(uid, "Siz botdan chiqarildingiz.")
+            except Exception:
+                pass
+            await q.answer(f"{w[0]} chiqarildi")
+        else:
+            db.execute("UPDATE workers SET active=1 WHERE user_id=?", (uid,))
+            db.commit()
+            try:
+                await context.bot.send_message(uid, "Siz botga qayta qo'shildingiz. Yozishingiz mumkin.")
+            except Exception:
+                pass
+            await q.answer(f"{w[0]} qaytarildi")
+        await q.edit_message_text(
+            "👷 Ishchilar (bosib chiqarish yoki qaytarish mumkin).\n"
+            "Ularning eski hisobotlari sizda saqlanib qoladi.",
+            reply_markup=workers_keyboard()
+        )
+        return
     if q.data == "clear":
         rows = db.execute("SELECT chat_id, message_id FROM pending").fetchall()
         n = await delete_rows(context.bot, rows)
@@ -181,9 +237,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(ADMIN_HELP)
         return
 
-    name = get_name(uid)
+    w = get_worker(uid)
+    if w and not w[1]:  # chiqarilgan ishchi
+        await msg.reply_text("Siz botdan chiqarilgansiz. Xabaringiz yuborilmadi.")
+        return
+    name = w[0] if w else None
     if not name:  # birinchi yozgani — ismi
-        db.execute("INSERT INTO workers VALUES (?,?)", (uid, text))
+        db.execute("INSERT INTO workers (user_id, name, active) VALUES (?,?,1)", (uid, text))
         db.commit()
         await msg.reply_text(
             f"Rahmat, {text}! Endi ortgan yoki tushirgan narsangizni yozing.\n"
@@ -260,10 +320,15 @@ async def kecha(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ishchilar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
-    rows = db.execute("SELECT name FROM workers ORDER BY name").fetchall()
-    text = ("👷 Ishchilar:\n" + "\n".join(f"{i}. {r[0]}" for i, r in enumerate(rows, 1))
-            if rows else "Hali ishchi yo'q.")
-    await update.message.reply_text(text)
+    kb = workers_keyboard()
+    if not kb:
+        await update.message.reply_text("Hali ishchi yo'q.")
+        return
+    await update.message.reply_text(
+        "👷 Ishchilar (bosib chiqarish yoki qaytarish mumkin).\n"
+        "Ularning eski hisobotlari sizda saqlanib qoladi.",
+        reply_markup=kb
+    )
 
 
 def main():
